@@ -471,34 +471,65 @@ eject_one() {
   local parent
   parent="$(parent_disk "$ident")"
 
-  # 1. Маркер -- демон не должен перемонтировать пока идёт eject
+  # 1. Маркер -- демон не должен перемонтировать пока идёт eject.
   touch "$(eject_marker_path "$ident")" 2>/dev/null || true
 
-  # 2. Деликатное размонтирование через diskutil (даёт ntfs-3g шанс
-  #    корректно сбросить кэш и отвалиться).  НЕ используем pkill -9:
-  #    он рвёт FUSE-T NFS-канал, и macOS отключает само USB-устройство.
+  # 2. ОТМОНТИРОВАТЬ наш FUSE-T NFS-mount явно. diskutil его НЕ видит
+  #    (это сетевой NFS, не в DiskArbitration базе), поэтому
+  #    `diskutil eject` всегда отвечает "Volume failed to eject", пока
+  #    наш mount живой.
+  local fuse_mp
+  fuse_mp="$(/sbin/mount 2>/dev/null | awk '
+    $1 ~ "^fuse-t:" {
+      s = index($0, " on "); rest = substr($0, s+4);
+      e = index(rest, " ("); print substr(rest, 1, e-1); exit
+    }')"
+  if [[ -n "$fuse_mp" ]]; then
+    info "Размонтирую FUSE-T mount: $fuse_mp"
+    diskutil unmount "$fuse_mp" >/dev/null 2>&1 \
+      || $SUDO_CMD umount "$fuse_mp" >/dev/null 2>&1 \
+      || $SUDO_CMD umount -f "$fuse_mp" >/dev/null 2>&1 \
+      || warn "не удалось размонтировать $fuse_mp"
+  fi
+
+  # 3. Деликатно завершить ntfs-3g процесс (SIGTERM, НЕ -9).
+  #    SIGTERM позволяет ntfs-3g корректно отписаться от FUSE-T NFS;
+  #    SIGKILL рвёт канал и macOS физически отключает USB-устройство.
+  local pids
+  pids="$(pgrep -f "ntfs-3g .*/dev/$ident " 2>/dev/null || true)"
+  if [[ -n "$pids" ]]; then
+    info "Завершаю ntfs-3g (SIGTERM): $pids"
+    echo "$pids" | xargs -n1 $SUDO_CMD kill -TERM 2>/dev/null || true
+    sleep 1
+    pids="$(pgrep -f "ntfs-3g .*/dev/$ident " 2>/dev/null || true)"
+    if [[ -n "$pids" ]]; then
+      sleep 1
+      echo "$pids" | xargs -n1 $SUDO_CMD kill 2>/dev/null || true
+    fi
+  fi
+
+  # 4. Подчищаем опустевший mount-point.
+  if [[ -n "$fuse_mp" && -d "$fuse_mp" ]]; then
+    $SUDO_CMD rmdir "$fuse_mp" 2>/dev/null || true
+  fi
+
+  # 5. Теперь eject должен пройти -- ничего нашего на диске не висит.
   info "Извлекаю /dev/$parent..."
   if diskutil eject "$parent" 2>&1; then
     ok "Извлечено: $parent"
     return 0
   fi
 
-  # 3. Если eject отказался -- значит что-то держит. Сначала пробуем
-  #    мягкий unmount через diskutil, потом force unmount, и только в
-  #    самом крайнем случае убиваем ntfs-3g процесс (диск может отвалиться).
-  warn "diskutil eject отказался, пробую размонтировать всё для /dev/$ident"
+  # 6. Если всё ещё отказывает -- запускаем доп. unmount всех конкурентов
+  warn "diskutil eject отказался -- пробую дополнительный unmount"
   unmount_competitors "$ident" "" ""
   sleep 1
-
   if diskutil eject "$parent" 2>&1; then
     ok "Извлечено: $parent"
     return 0
   fi
 
-  warn "Не помогло. Запускаю force unmount + eject. После этого USB может физически отключиться."
-  diskutil unmountDisk force "$parent" 2>&1 || true
-  sleep 1
-  diskutil eject "$parent" 2>&1 || warn "eject провален. Извлеките USB физически."
+  warn "eject провален. Том размонтирован, можно извлечь USB физически."
 }
 
 each_ntfs() {
