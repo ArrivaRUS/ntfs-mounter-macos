@@ -9,7 +9,12 @@
 #
 # <disk> — идентификатор раздела (например disk4s1) ИЛИ метка тома ("MyDrive").
 
-set -euo pipefail
+# Намеренно НЕ используем `set -e` -- он слишком агрессивный для скрипта,
+# который часто работает с командами, возвращающими "успешный" non-zero
+# (ntfsfix journal replay, diskutil unmount при отсутствии mount-а, и т.п.).
+# Поэтому мы вручную проверяем критические exit-коды через ntfs3g_rc=$? и
+# подобные паттерны, а не полагаемся на abort-on-error.
+set -uo pipefail
 
 NTFS_3G_BIN="${NTFS_3G_BIN:-/usr/local/bin/ntfs-3g}"
 DEFAULT_MOUNT_ROOT="/Volumes"
@@ -378,20 +383,6 @@ mount_one() {
 
   $SUDO_CMD mkdir -p "$target_mp"
   _trace "mkdir $target_mp OK"
-
-  # Pre-mount health check (только информационный). Если NTFS повреждён --
-  # предупреждаем пользователя, что нужен chkdsk на Windows. ntfs-3g всё равно
-  # попробует смонтировать и часто это удаётся, но операции с MFT (rmdir пустых
-  # директорий и т.п.) могут не работать корректно.
-  if command -v /usr/local/bin/ntfsfix >/dev/null 2>&1; then
-    local fix_out
-    fix_out="$($SUDO_CMD /usr/local/bin/ntfsfix -n "/dev/$ident" 2>&1)"
-    if echo "$fix_out" | grep -q "Volume is corrupt"; then
-      warn "NTFS-том /dev/$ident помечен как повреждённый."
-      warn "Для полной починки запустите chkdsk /f на Windows-машине."
-      warn "Без этого rmdir и некоторые другие операции могут возвращать ошибки."
-    fi
-  fi
 
   info "Монтирую /dev/$ident -> $target_mp (через ntfs-3g, RW)..."
   _trace "вызываю ntfs-3g"
