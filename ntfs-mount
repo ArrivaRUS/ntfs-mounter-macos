@@ -140,6 +140,34 @@ resolve_disk() {
       break
     fi
   done < <(list_ntfs_partitions)
+
+  # Fallback: возможно diskutil временно не показывает Personality
+  # (бывает когда диск смонтирован через FUSE-T NFS) -- ищем в /sbin/mount
+  # по нашему fuse-t URL и проверяем что target -- это label или device.
+  if [[ -z "$found" ]]; then
+    # Может быть передан label
+    local fuse_label
+    fuse_label="$(/sbin/mount 2>/dev/null | awk -v lbl="$target" '
+      $1 == "fuse-t:/" lbl {found=1} END {if (found) print lbl}')"
+    if [[ -n "$fuse_label" ]]; then
+      # Нашли по label -- найти соответствующий disk через mount point
+      local mp_for_label
+      mp_for_label="$(/sbin/mount 2>/dev/null | awk -v lbl="$target" '
+        $1 == "fuse-t:/" lbl { s = index($0, " on "); rest = substr($0, s+4);
+                                e = index(rest, " ("); print substr(rest, 1, e-1); }')"
+      # disk6s2 в args ntfs-3g процесса
+      found="$(pgrep -alf "ntfs-3g .*$mp_for_label" 2>/dev/null | head -1 \
+                | grep -oE '/dev/disk[0-9]+s[0-9]+' | head -1 | sed 's|/dev/||')"
+    fi
+
+    # Может быть передан device id напрямую -- проверим что ntfs-3g на нём живёт
+    if [[ -z "$found" && "$target" =~ ^disk[0-9]+s[0-9]+$ ]]; then
+      if pgrep -f "ntfs-3g .*/dev/$target " >/dev/null 2>&1; then
+        found="$target"
+      fi
+    fi
+  fi
+
   echo "$found"
 }
 
@@ -298,6 +326,21 @@ mount_one() {
   unmount_competitors "$ident" "" "$label"
 
   $SUDO_CMD mkdir -p "$target_mp"
+
+  # Pre-mount health check (только информационный). Если NTFS повреждён --
+  # предупреждаем пользователя, что нужен chkdsk на Windows. ntfs-3g всё равно
+  # попробует смонтировать и часто это удаётся, но операции с MFT (rmdir пустых
+  # директорий и т.п.) могут не работать корректно.
+  if command -v /usr/local/bin/ntfsfix >/dev/null 2>&1; then
+    local fix_out
+    fix_out="$($SUDO_CMD /usr/local/bin/ntfsfix -n "/dev/$ident" 2>&1)"
+    if echo "$fix_out" | grep -q "Volume is corrupt"; then
+      warn "NTFS-том /dev/$ident помечен как повреждённый."
+      warn "Для полной починки запустите chkdsk /f на Windows-машине."
+      warn "Без этого rmdir и некоторые другие операции могут возвращать ошибки."
+    fi
+  fi
+
   info "Монтирую /dev/$ident -> $target_mp (через ntfs-3g, RW)..."
 
   # Опции:
@@ -380,31 +423,31 @@ eject_one() {
   # 1. Маркер -- демон не должен перемонтировать пока идёт eject
   touch "$(eject_marker_path "$ident")" 2>/dev/null || true
 
-  # 2. Размонтируем все mount'ы для этого устройства (наш ntfs-3g + любые конкуренты)
-  info "Размонтирую все маунты для /dev/$ident..."
-  unmount_competitors "$ident" "" ""
-
-  # Дополнительно убьём наш ntfs-3g процесс, если он остался висеть на этом девайсе
-  local pids
-  pids="$(pgrep -f "ntfs-3g .*/dev/$ident " 2>/dev/null || true)"
-  if [[ -n "$pids" ]]; then
-    info "Убиваю ntfs-3g процессы: $pids"
-    echo "$pids" | xargs -r $SUDO_CMD kill -TERM 2>/dev/null || true
-    sleep 1
-    echo "$pids" | xargs -r $SUDO_CMD kill -9 2>/dev/null || true
-  fi
-
-  # 3. Eject parent disk через diskutil (это безопасно отключит устройство)
+  # 2. Деликатное размонтирование через diskutil (даёт ntfs-3g шанс
+  #    корректно сбросить кэш и отвалиться).  НЕ используем pkill -9:
+  #    он рвёт FUSE-T NFS-канал, и macOS отключает само USB-устройство.
   info "Извлекаю /dev/$parent..."
   if diskutil eject "$parent" 2>&1; then
     ok "Извлечено: $parent"
-  else
-    warn "diskutil eject не справился, пробую через force unmount всех маунтов"
-    diskutil unmountDisk force "$parent" 2>&1 || true
+    return 0
   fi
 
-  # 4. Marker удаляем не сразу -- демон должен видеть его ещё пару секунд,
-  #    чтобы не успеть перемонтировать. Авто-cleanup через TTL.
+  # 3. Если eject отказался -- значит что-то держит. Сначала пробуем
+  #    мягкий unmount через diskutil, потом force unmount, и только в
+  #    самом крайнем случае убиваем ntfs-3g процесс (диск может отвалиться).
+  warn "diskutil eject отказался, пробую размонтировать всё для /dev/$ident"
+  unmount_competitors "$ident" "" ""
+  sleep 1
+
+  if diskutil eject "$parent" 2>&1; then
+    ok "Извлечено: $parent"
+    return 0
+  fi
+
+  warn "Не помогло. Запускаю force unmount + eject. После этого USB может физически отключиться."
+  diskutil unmountDisk force "$parent" 2>&1 || true
+  sleep 1
+  diskutil eject "$parent" 2>&1 || warn "eject провален. Извлеките USB физически."
 }
 
 each_ntfs() {

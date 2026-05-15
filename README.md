@@ -99,6 +99,9 @@ These are real problems we hit while building this, and the workarounds are bake
 | Zombie `ntfs-3g` processes survive a USB unplug and keep holding `/Volumes/<label>` with stale data | `mount_one` inspects `ps -o args=` and `kill -9`s ntfs-3g processes whose `/dev/diskX` no longer matches the current device |
 | When daemon runs as root, `$(id -un)` returns `root` and the mount ends up with `uid=0` (nobody but root can write) | `resolve_owner` first reads `NTFS_OWNER_USER` env, then falls back to `stat -f '%Su' /dev/console`, then to first uid≥501 from `dscl` — and refuses to mount if it still gets `0` |
 | `diskutil info` doesn't report mount points for FUSE-T NFS-based mounts | Parser falls back to `/sbin/mount` matching by `/dev/diskX`, then by `fuse-t:/<label>`, then by guessing `/Volumes/<label>` |
+| `ntfs-mount eject` couldn't find a disk that `diskutil` had stopped tagging as NTFS (because FUSE-T was holding it) | `resolve_disk` falls back to scanning live fuse-t mounts via `mount` + introspecting `ntfs-3g` process args |
+| Apple's Spotlight and `fseventsd` hold files open on NTFS volumes, breaking Finder's move-to-Trash with "object is in use" | After every mount the utility runs `mdutil -i off` on the volume and touches `.fseventsd/no_log` |
+| NTFS volumes silently accumulate journal/MFT damage on macOS (no native chkdsk) and start refusing `rmdir` | Pre-mount we run `ntfsfix -n` and log a clear warning advising `chkdsk /f` on Windows. Periodic Windows-side check is mandatory for heavily-used NTFS drives. |
 
 ## Components
 
@@ -120,9 +123,11 @@ FUSE-T routes I/O through a user-space NFS server, so throughput is noticeably b
 
 ## Caveats
 
-- **Don't pull the plug.** Always Eject through the menu-bar (or `ntfs-mount unmount`). FUSE-T caches writes; physical disconnect without sync risks NTFS journal damage.
+- **Don't pull the plug.** Always Eject through the menu-bar (or `ntfs-mount eject`). FUSE-T caches writes; physical disconnect without sync risks NTFS journal damage.
 - After the first write to a drive that was last touched by Windows with **Fast Startup** enabled, macOS may pop up "Disk needs to be checked" — this is the NTFS journal flag flipping. Press *Skip* / *Ignore*.
 - The Apple FSKit NTFS driver on macOS Tahoe **will** keep trying to mount your drive in parallel. The daemon keeps killing it. If you stop the daemon (`sudo launchctl bootout system/com.user.ntfs-automount`), you'll be back to read-only mode within seconds.
+- **macOS has no full NTFS repair tool.** `ntfsfix` shipped with this project only replays the journal — it can't fix MFT-level corruption that builds up after improper unmounts or hard kills of `ntfs-3g`. If you see `Volume is corrupt` from `ntfsfix -n`, or notice empty directories that refuse to `rmdir` with `Directory not empty`, you need to plug the disk into a **Windows machine** and run `chkdsk D: /f /r`. On the next reconnect to macOS those phantom entries will be gone. There is no Mac-side workaround for this.
+- **Don't `kill -9` ntfs-3g.** Hard-killing the `ntfs-3g` process tears down the FUSE-T NFS channel mid-flight, which makes macOS *eject the entire USB device*. The `eject` command in this utility uses `diskutil eject` (graceful) rather than killing processes, exactly for this reason.
 
 ## Uninstall
 
