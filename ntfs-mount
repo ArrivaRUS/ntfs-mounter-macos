@@ -133,6 +133,20 @@ list_ntfs_partitions() {
 resolve_disk() {
   local target="$1"
   local found=""
+
+  # Быстрый прямой путь: если target -- это disk-id, и diskutil знает что
+  # это NTFS-ish раздел -- сразу доверяем. Это обходит race condition с
+  # list_ntfs_partitions, который теряет диски на 1-2 секунды после
+  # unmount competitor'а от Apple FSKit (diskutil пересоздаёт state).
+  if [[ "$target" =~ ^disk[0-9]+s[0-9]+$ ]]; then
+    local info_quick
+    info_quick="$(diskutil info "$target" 2>/dev/null)"
+    if echo "$info_quick" | grep -qiE "NTFS|Windows_NTFS|Microsoft Basic Data"; then
+      echo "$target"
+      return 0
+    fi
+  fi
+
   while IFS='|' read -r ident label fs mountpt; do
     [[ -z "$ident" ]] && continue
     if [[ "$ident" == "$target" || "$label" == "$target" ]]; then
@@ -289,6 +303,23 @@ mount_one() {
   local ident="$1"
   local mountpt label fs
   IFS='|' read -r _ident label fs mountpt < <(list_ntfs_partitions | awk -F'|' -v d="$ident" '$1==d')
+
+  # Гоночный fallback: если list_ntfs_partitions сейчас не показывает disk
+  # (Apple FSKit только что отвалился и diskutil ещё не перепрочитал
+  # Personality), пытаемся получить метаданные напрямую из diskutil info.
+  if [[ -z "$_ident" ]]; then
+    local info_direct
+    info_direct="$(diskutil info "$ident" 2>/dev/null)"
+    if echo "$info_direct" | grep -qiE "NTFS|Windows_NTFS|Microsoft Basic Data"; then
+      _ident="$ident"
+      label="$(printf '%s\n' "$info_direct" | awk -F: '/^[[:space:]]*Volume Name/ { sub(/^[[:space:]]+/, "", $2); print $2; exit }')"
+      [[ -z "$label" ]] && label="(no label)"
+      mountpt="$(printf '%s\n' "$info_direct" | awk -F: '/^[[:space:]]*Mount Point/ { sub(/^[[:space:]]+/, "", $2); print $2; exit }')"
+      [[ "$mountpt" == "Not applicable (no file system)" ]] && mountpt=""
+      info "list_ntfs_partitions race -- использую diskutil info напрямую для $ident"
+    fi
+  fi
+
   [[ -z "$_ident" ]] && die "Раздел $ident не найден или не NTFS."
 
   local target_mp="$DEFAULT_MOUNT_ROOT/$label"
