@@ -303,15 +303,27 @@ mount_one() {
   # Опции:
   #   recover, remove_hiberfile -- лечат unsafe state и hibernate flag (Windows Fast Startup)
   #   auto_xattr, big_writes, allow_other -- совместимость / производительность
+  #   noatime -- не обновляем access time (меньше блокировок при чтении папок Finder'ом)
   #   uid/gid -- владелец смонтированной ФС = пользователь GUI
   #   local -- помечает том как локальный (виден в боковой панели Finder)
   $SUDO_CMD "$NTFS_3G_BIN" "/dev/$ident" "$target_mp" \
-    -o "recover,remove_hiberfile,auto_xattr,allow_other,big_writes,uid=$OWNER_UID,gid=$OWNER_GID,local,volname=$label"
+    -o "recover,remove_hiberfile,auto_xattr,allow_other,big_writes,noatime,uid=$OWNER_UID,gid=$OWNER_GID,local,volname=$label"
 
   # 2. Даём macOS секунду чтобы попытаться смонтировать тот же диск через FSKit,
   #    потом отстреливаем эти конкурирующие маунты
   sleep 1
   unmount_competitors "$ident" "$target_mp" "$label"
+
+  # 3. Запрещаем Spotlight индексировать NTFS-том -- его mds_stores процесс
+  #    держит файлы открытыми и Finder не может их удалить ("объект используется").
+  if command -v mdutil >/dev/null 2>&1; then
+    $SUDO_CMD mdutil -i off "$target_mp" >/dev/null 2>&1 || true
+  fi
+
+  # 4. Подавляем fseventsd на этом томе -- маркер-файл, который ему говорит
+  #    "не логируй сюда события" (тоже один из источников блокировок).
+  $SUDO_CMD mkdir -p "$target_mp/.fseventsd" 2>/dev/null || true
+  $SUDO_CMD touch "$target_mp/.fseventsd/no_log" 2>/dev/null || true
 
   ok "Смонтирован: $target_mp (RW)"
 }
