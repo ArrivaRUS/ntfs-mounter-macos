@@ -297,12 +297,18 @@ unmount_competitors() {
   done <<< "$mps"
 }
 
+_trace() { info "[trace] $1"; }
+
 mount_one() {
+  _trace "mount_one: start ident=$1 uid=$(id -u) pid=$$"
   require_bin
+  _trace "require_bin OK"
   resolve_owner
+  _trace "resolve_owner OK: OWNER_UID=$OWNER_UID OWNER_GID=$OWNER_GID"
   local ident="$1"
   local mountpt label fs
   IFS='|' read -r _ident label fs mountpt < <(list_ntfs_partitions | awk -F'|' -v d="$ident" '$1==d')
+  _trace "list_ntfs lookup: _ident='$_ident' label='$label' mountpt='$mountpt'"
 
   # Гоночный fallback: если list_ntfs_partitions сейчас не показывает disk
   # (Apple FSKit только что отвалился и diskutil ещё не перепрочитал
@@ -354,9 +360,24 @@ mount_one() {
 
   # 1. Зачистка: убираем ВСЕ существующие маунты для этого диска
   #    (RO от Apple FSKit, старые fuse-t маунты, и т.п.)
+  _trace "calling unmount_competitors"
   unmount_competitors "$ident" "" "$label"
+  _trace "unmount_competitors done, waiting 3s for diskutil to re-stabilise /dev/$ident"
+  sleep 3
+
+  # Проверка: устройство ещё доступно? После unmount diskutil может его
+  # временно отвязать, в таком случае ntfs-3g упадёт молча.
+  if [ ! -e "/dev/$ident" ]; then
+    warn "ВНИМАНИЕ: /dev/$ident исчез после unmount_competitors -- жду ещё 3с"
+    sleep 3
+  fi
+  if [ ! -e "/dev/$ident" ]; then
+    die "/dev/$ident всё ещё недоступен. Apple FSKit, видимо, не вернул устройство. Переподключите USB."
+  fi
+  _trace "/dev/$ident существует"
 
   $SUDO_CMD mkdir -p "$target_mp"
+  _trace "mkdir $target_mp OK"
 
   # Pre-mount health check (только информационный). Если NTFS повреждён --
   # предупреждаем пользователя, что нужен chkdsk на Windows. ntfs-3g всё равно
@@ -373,6 +394,7 @@ mount_one() {
   fi
 
   info "Монтирую /dev/$ident -> $target_mp (через ntfs-3g, RW)..."
+  _trace "вызываю ntfs-3g"
 
   # Опции:
   #   recover, remove_hiberfile -- лечат unsafe state и hibernate flag (Windows Fast Startup)
@@ -380,8 +402,15 @@ mount_one() {
   #   noatime -- не обновляем access time (меньше блокировок при чтении папок Finder'ом)
   #   uid/gid -- владелец смонтированной ФС = пользователь GUI
   #   local -- помечает том как локальный (виден в боковой панели Finder)
+  set +e
   $SUDO_CMD "$NTFS_3G_BIN" "/dev/$ident" "$target_mp" \
     -o "recover,remove_hiberfile,auto_xattr,allow_other,big_writes,noatime,uid=$OWNER_UID,gid=$OWNER_GID,local,volname=$label"
+  ntfs3g_rc=$?
+  set -e
+  _trace "ntfs-3g вернул код $ntfs3g_rc"
+  if [ "$ntfs3g_rc" -ne 0 ]; then
+    die "ntfs-3g упал с кодом $ntfs3g_rc"
+  fi
 
   # 2. Даём macOS секунду чтобы попытаться смонтировать тот же диск через FSKit,
   #    потом отстреливаем эти конкурирующие маунты
