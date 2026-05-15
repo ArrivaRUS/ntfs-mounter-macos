@@ -102,11 +102,22 @@ while :; do
 
     log "NTFS $id ($reason) -- жду ${DEBOUNCE_SEC}s и монтирую через ntfs-3g"
     sleep "$DEBOUNCE_SEC"
-    if NTFS_OWNER_USER="$OWNER_USER" "$NTFS_MOUNT_BIN" mount "$id" 2>&1 | sed "s/^/[$id] /"; then
+
+    # Логируем ВЕСЬ вывод (stdout+stderr) ntfs-mount во временный файл,
+    # затем кладём в лог построчно с префиксом [id]. Сохраняем exit-code
+    # самого ntfs-mount (без pipefail-зависимости -- через PIPESTATUS не
+    # надёжно на bash 3.2 в этом потоке).
+    mount_out="$(mktemp /tmp/ntfs-mount-out.XXXXXX)"
+    NTFS_OWNER_USER="$OWNER_USER" "$NTFS_MOUNT_BIN" mount "$id" >"$mount_out" 2>&1
+    mount_rc=$?
+    sed "s/^/[$id] /" "$mount_out"
+    rm -f "$mount_out"
+
+    if [ "$mount_rc" -eq 0 ]; then
       log "OK: $id смонтирован в RW"
       mark_handled "$id"
     else
-      log "FAIL: не удалось смонтировать $id -- повторю в следующем цикле"
+      log "FAIL($mount_rc): не удалось смонтировать $id -- повторю в следующем цикле"
     fi
   done <<< "$rows"
 
