@@ -1,0 +1,24 @@
+# Локальные клоны ntfs-3g (получаются через install.sh)
+ntfs-3g-src/
+ltmain.sh
+
+# Сборочные артефакты Swift
+*.dSYM/
+*.app/
+
+# macOS системные
+.DS_Store
+._*
+.AppleDouble
+.LSOverride
+.Spotlight-V100
+.Trashes
+
+# Логи
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo

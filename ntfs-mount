@@ -1,0 +1,392 @@
+#!/usr/bin/env bash
+# ntfs-mount — удобная CLI-обёртка для работы с NTFS-дисками на macOS через FUSE-T + ntfs-3g.
+#
+# Команды:
+#   ntfs-mount list                — показать все NTFS-разделы и их статус
+#   ntfs-mount mount <disk|all>    — отмонтировать RO Apple-драйвер и смонтировать через ntfs-3g (RW)
+#   ntfs-mount unmount <disk|all>  — безопасно отмонтировать
+#   ntfs-mount auto                — найти все NTFS и перемонтировать в RW (без аргумента = mount all)
+#
+# <disk> — идентификатор раздела (например disk4s1) ИЛИ метка тома ("MyDrive").
+
+set -euo pipefail
+
+NTFS_3G_BIN="${NTFS_3G_BIN:-/usr/local/bin/ntfs-3g}"
+DEFAULT_MOUNT_ROOT="/Volumes"
+
+C_GREEN='\033[0;32m'
+C_YELLOW='\033[1;33m'
+C_RED='\033[0;31m'
+C_BLUE='\033[0;34m'
+C_DIM='\033[2m'
+C_OFF='\033[0m'
+
+ok()   { printf "${C_GREEN}✓${C_OFF}  %s\n" "$*"; }
+info() { printf "${C_BLUE}ℹ${C_OFF}  %s\n" "$*"; }
+warn() { printf "${C_YELLOW}!${C_OFF}  %s\n" "$*"; }
+err()  { printf "${C_RED}✗${C_OFF}  %s\n" "$*" >&2; }
+die()  { err "$*"; exit 1; }
+
+require_bin() {
+  if [[ ! -x "$NTFS_3G_BIN" ]]; then
+    die "ntfs-3g не найден ($NTFS_3G_BIN). Запустите: bash ~/ntfs-utility/install.sh"
+  fi
+}
+
+usage() {
+  cat <<'EOF'
+ntfs-mount — CLI для работы с NTFS-дисками на macOS через FUSE-T + ntfs-3g.
+
+Команды:
+  ntfs-mount list                — показать все NTFS-разделы и их статус
+  ntfs-mount mount <disk|all>    — отмонтировать RO-маунт Apple и поднять через ntfs-3g (RW)
+  ntfs-mount unmount <disk|all>  — безопасно отмонтировать
+  ntfs-mount auto                — перемонтировать все NTFS в RW (= mount all)
+
+<disk> — идентификатор раздела (например disk4s1) ИЛИ метка тома ("MyDrive").
+EOF
+  exit "${1:-0}"
+}
+
+# Возвращает строки вида: "diskXsY|Label|TYPE|MOUNT_POINT"
+list_ntfs_partitions() {
+  # Собираем все идентификаторы вида diskXsY из текстового вывода diskutil list.
+  local ids
+  ids="$(diskutil list 2>/dev/null | awk '
+    /^[[:space:]]+[0-9]+:/ {
+      for (i=1; i<=NF; i++) {
+        if ($i ~ /^disk[0-9]+s[0-9]+$/) { print $i }
+      }
+    }
+  ' | sort -u)"
+
+  [[ -z "$ids" ]] && return 0
+
+  local ident info fs label mountpt
+  while IFS= read -r ident; do
+    [[ -z "$ident" ]] && continue
+    info="$(diskutil info "$ident" 2>/dev/null)" || continue
+
+    # Тип ФС из строки "Type (Bundle):" — это самое надёжное (содержит "ntfs" или "ntfs-3g").
+    fs="$(printf '%s\n' "$info" | awk -F: '/^[[:space:]]*Type \(Bundle\)/ { sub(/^[[:space:]]+/, "", $2); print $2; exit }')"
+    # fallback: "File System Personality"
+    if [[ -z "$fs" ]]; then
+      fs="$(printf '%s\n' "$info" | awk -F: '/^[[:space:]]*File System Personality/ { sub(/^[[:space:]]+/, "", $2); print $2; exit }')"
+    fi
+    [[ -z "$fs" ]] && continue
+
+    # Фильтруем по NTFS (любой вариант: ntfs, NTFS, Windows_NTFS, ntfs-3g).
+    case "$(printf '%s' "$fs" | tr '[:upper:]' '[:lower:]')" in
+      *ntfs*) ;;
+      *) continue ;;
+    esac
+
+    label="$(printf '%s\n' "$info" | awk -F: '/^[[:space:]]*Volume Name/ { sub(/^[[:space:]]+/, "", $2); print $2; exit }')"
+    [[ -z "$label" || "$label" == "Not applicable (no file system)" ]] && label="(no label)"
+
+    mountpt="$(printf '%s\n' "$info" | awk -F: '/^[[:space:]]*Mount Point/ { sub(/^[[:space:]]+/, "", $2); print $2; exit }')"
+    [[ "$mountpt" == "Not applicable (no file system)" ]] && mountpt=""
+
+    # FUSE-маунты diskutil не видит. Fallback 1: ищем по /dev/$ident в `mount`.
+    if [[ -z "$mountpt" ]]; then
+      mountpt="$(/sbin/mount 2>/dev/null | awk -v dev="/dev/$ident" '
+        $1 == dev {
+          s = index($0, " on ");
+          rest = substr($0, s + 4);
+          e = index(rest, " (");
+          if (e > 0) print substr(rest, 1, e - 1);
+          else print rest;
+          exit
+        }')"
+    fi
+
+    # Fallback 2: ntfs-3g через FUSE-T работает как NFS-server и в `mount`
+    # выглядит как "fuse-t:/<label> on /Volumes/<label> (nfs)" -- не привязан
+    # к /dev/diskX. Ищем по label.
+    if [[ -z "$mountpt" && -n "$label" && "$label" != "(no label)" ]]; then
+      mountpt="$(/sbin/mount 2>/dev/null | awk -v src="fuse-t:/$label" '
+        $1 == src {
+          s = index($0, " on ");
+          rest = substr($0, s + 4);
+          e = index(rest, " (");
+          if (e > 0) print substr(rest, 1, e - 1);
+          else print rest;
+          exit
+        }')"
+    fi
+
+    # Fallback 3: предположительная точка по умолчанию /Volumes/<label> --
+    # если она реально mountpoint и принадлежит нам, считаем диск смонтированным
+    if [[ -z "$mountpt" && -n "$label" && "$label" != "(no label)" ]]; then
+      local guess="$DEFAULT_MOUNT_ROOT/$label"
+      if /sbin/mount 2>/dev/null | awk -v mp="$guess" '$3 == mp' | grep -qE "nfs|ntfs-3g|fuse-t|macfuse"; then
+        mountpt="$guess"
+      fi
+    fi
+
+    printf '%s|%s|%s|%s\n' "$ident" "$label" "$fs" "$mountpt"
+  done <<< "$ids"
+}
+
+# Разрешает аргумент пользователя (disk-id или label) в device-id
+resolve_disk() {
+  local target="$1"
+  local found=""
+  while IFS='|' read -r ident label fs mountpt; do
+    [[ -z "$ident" ]] && continue
+    if [[ "$ident" == "$target" || "$label" == "$target" ]]; then
+      found="$ident"
+      break
+    fi
+  done < <(list_ntfs_partitions)
+  echo "$found"
+}
+
+cmd_list() {
+  local rows
+  rows="$(list_ntfs_partitions || true)"
+  if [[ -z "$rows" ]]; then
+    info "NTFS-разделов не найдено. Убедитесь, что диск подключён."
+    return 0
+  fi
+  printf "%-12s  %-24s  %-10s  %s\n" "DEVICE" "LABEL" "FS" "MOUNT POINT"
+  printf "%-12s  %-24s  %-10s  %s\n" "------" "-----" "--" "-----------"
+  while IFS='|' read -r ident label fs mountpt; do
+    [[ -z "$ident" ]] && continue
+    local mp_disp="$mountpt"
+    [[ -z "$mp_disp" ]] && mp_disp="${C_DIM}(не смонтирован)${C_OFF}"
+    # помечаем RW/RO. Логика:
+    #   - источник "fuse-t:..." или тип "ntfs-3g"/"fuse-t"/"macfuse" -> наш RW
+    #   - "read-only" -> RO
+    #   - всё остальное -> RW по умолчанию (apple ntfs обычно read-only,
+    #     но определяется выше через `read-only` маркер)
+    local rw_tag=""
+    if [[ -n "$mountpt" ]]; then
+      local mline
+      mline="$(/sbin/mount 2>/dev/null | awk -v mp="$mountpt" '$3 == mp')"
+      if echo "$mline" | grep -qE "^fuse-t:|ntfs-3g|macfuse"; then
+        rw_tag=" ${C_GREEN}[RW]${C_OFF}"
+      elif echo "$mline" | grep -q "read-only"; then
+        rw_tag=" ${C_YELLOW}[RO]${C_OFF}"
+      else
+        rw_tag=" ${C_GREEN}[RW]${C_OFF}"
+      fi
+    fi
+    printf "%-12s  %-24s  %-10s  %b%b\n" "$ident" "$label" "$fs" "$mp_disp" "$rw_tag"
+  done <<< "$rows"
+}
+
+# SUDO_CMD пустой, если уже root, иначе "sudo"
+SUDO_CMD=""
+[[ "$(id -u)" != "0" ]] && SUDO_CMD="sudo"
+
+# OWNER_UID/OWNER_GID — uid/gid пользователя, под которым должен быть владелец
+# смонтированной ФС. По умолчанию текущий пользователь, но если нас вызвал
+# демон от root — берём из переменной окружения NTFS_OWNER_USER.
+resolve_owner() {
+  local user="${NTFS_OWNER_USER:-}"
+
+  # Если env пустой и мы запущены от root (демон) -- НЕ хотим uid=0.
+  # Берём GUI-консольного пользователя из /dev/console.
+  if [[ -z "$user" && "$(id -u)" == "0" ]]; then
+    user="$(stat -f '%Su' /dev/console 2>/dev/null)"
+  fi
+
+  # Финальный fallback -- текущий пользователь
+  [[ -z "$user" || "$user" == "root" ]] && user="$(id -un)"
+
+  OWNER_UID="$(id -u "$user" 2>/dev/null || echo "")"
+  OWNER_GID="$(id -g "$user" 2>/dev/null || echo "")"
+
+  # Никогда не монтируем с uid=0 -- это сделает диск root-only
+  if [[ -z "$OWNER_UID" || "$OWNER_UID" == "0" ]]; then
+    # последняя попытка: найти первого uid>=501 в системе
+    user="$(dscl . -list /Users UniqueID 2>/dev/null | awk '$2 >= 501 && $2 < 1000 { print $1; exit }')"
+    [[ -n "$user" ]] && OWNER_UID="$(id -u "$user")" && OWNER_GID="$(id -g "$user")"
+  fi
+
+  # Если всё равно 0 -- die, лучше совсем не монтировать
+  if [[ -z "$OWNER_UID" || "$OWNER_UID" == "0" ]]; then
+    die "Не удалось определить пользователя для монтирования (NTFS_OWNER_USER не задан, /dev/console=root). Запустите: NTFS_OWNER_USER=<your-username> ntfs-mount mount $1"
+  fi
+}
+
+# Отмонтировать все mount-точки для устройства /dev/$1, кроме $2.
+# Закрывает конкурирующие маунты от Apple FSKit (macOS Tahoe сама монтирует
+# каждый NTFS в read-only через FSKit, что блокирует запись для ntfs-3g).
+unmount_competitors() {
+  local dev="/dev/$1"
+  local keep="${2:-}"
+  local label="${3:-}"
+
+  # 1. Все маунты по device id
+  local mps
+  mps="$(/sbin/mount 2>/dev/null | awk -v dev="$dev" '
+    $1 == dev {
+      s = index($0, " on ");
+      rest = substr($0, s + 4);
+      e = index(rest, " (");
+      if (e > 0) print substr(rest, 1, e - 1);
+    }')"
+
+  # 2. Также мёртвые/висящие fuse-t NFS-маунты для этого label
+  if [[ -n "$label" ]]; then
+    local fmps
+    fmps="$(/sbin/mount 2>/dev/null | awk -v lbl=":$label" '
+      $1 ~ "^fuse-t:" && index($1, lbl) > 0 {
+        s = index($0, " on ");
+        rest = substr($0, s + 4);
+        e = index(rest, " (");
+        if (e > 0) print substr(rest, 1, e - 1);
+      }')"
+    [[ -n "$fmps" ]] && mps="$mps"$'\n'"$fmps"
+  fi
+
+  local mp
+  while IFS= read -r mp; do
+    [[ -z "$mp" ]] && continue
+    [[ "$mp" == "$keep" ]] && continue
+    info "Отмонтирую конкурирующий маунт: $mp"
+    diskutil unmount "$mp" >/dev/null 2>&1 \
+      || diskutil unmount force "$mp" >/dev/null 2>&1 \
+      || $SUDO_CMD umount -f "$mp" >/dev/null 2>&1 \
+      || warn "не получилось отмонтировать $mp"
+  done <<< "$mps"
+}
+
+mount_one() {
+  require_bin
+  resolve_owner
+  local ident="$1"
+  local mountpt label fs
+  IFS='|' read -r _ident label fs mountpt < <(list_ntfs_partitions | awk -F'|' -v d="$ident" '$1==d')
+  [[ -z "$_ident" ]] && die "Раздел $ident не найден или не NTFS."
+
+  local target_mp="$DEFAULT_MOUNT_ROOT/$label"
+  if [[ -z "$label" || "$label" == "(no label)" || "$label" == *"/"* ]]; then
+    target_mp="$DEFAULT_MOUNT_ROOT/NTFS-$ident"
+  fi
+
+  # Если уже наш ntfs-3g на правильной точке -- проверяем что он живой
+  # и привязан к ТЕКУЩЕМУ /dev/$ident, не к зомби-устройству.
+  if mount | awk -v mp="$target_mp" '$3==mp' | grep -qE "ntfs-3g|fuse-t"; then
+    local stale_pid
+    stale_pid="$(pgrep -f "ntfs-3g .*$target_mp" 2>/dev/null | head -1)"
+    if [[ -n "$stale_pid" ]]; then
+      # Проверим, что процесс держит именно текущий device
+      local proc_args
+      proc_args="$(ps -p "$stale_pid" -o args= 2>/dev/null)"
+      if [[ -n "$proc_args" ]] && ! echo "$proc_args" | grep -q "/dev/$ident "; then
+        warn "Обнаружен stale ntfs-3g (PID $stale_pid) на старом device -- убиваю"
+        $SUDO_CMD kill -9 "$stale_pid" 2>/dev/null || true
+        sleep 1
+        $SUDO_CMD umount -f "$target_mp" >/dev/null 2>&1 || true
+        sleep 1
+        # ниже произойдёт штатный mount
+      else
+        # живой и правильный -- зачищаем только конкурентов FSKit
+        unmount_competitors "$ident" "$target_mp" "$label"
+        info "$ident уже смонтирован через ntfs-3g: $target_mp"
+        return 0
+      fi
+    fi
+  fi
+
+  # 1. Зачистка: убираем ВСЕ существующие маунты для этого диска
+  #    (RO от Apple FSKit, старые fuse-t маунты, и т.п.)
+  unmount_competitors "$ident" "" "$label"
+
+  $SUDO_CMD mkdir -p "$target_mp"
+  info "Монтирую /dev/$ident -> $target_mp (через ntfs-3g, RW)..."
+
+  # Опции:
+  #   recover, remove_hiberfile -- лечат unsafe state и hibernate flag (Windows Fast Startup)
+  #   auto_xattr, big_writes, allow_other -- совместимость / производительность
+  #   uid/gid -- владелец смонтированной ФС = пользователь GUI
+  #   local -- помечает том как локальный (виден в боковой панели Finder)
+  $SUDO_CMD "$NTFS_3G_BIN" "/dev/$ident" "$target_mp" \
+    -o "recover,remove_hiberfile,auto_xattr,allow_other,big_writes,uid=$OWNER_UID,gid=$OWNER_GID,local,volname=$label"
+
+  # 2. Даём macOS секунду чтобы попытаться смонтировать тот же диск через FSKit,
+  #    потом отстреливаем эти конкурирующие маунты
+  sleep 1
+  unmount_competitors "$ident" "$target_mp" "$label"
+
+  ok "Смонтирован: $target_mp (RW)"
+}
+
+unmount_one() {
+  local ident="$1"
+  local mountpt
+  IFS='|' read -r _i _l _f mountpt < <(list_ntfs_partitions | awk -F'|' -v d="$ident" '$1==d')
+  [[ -z "$_i" ]] && die "Раздел $ident не найден."
+  if [[ -z "$mountpt" ]]; then
+    info "$ident не смонтирован."
+    return 0
+  fi
+  info "Отмонтирую $mountpt..."
+  if diskutil unmount "$mountpt" >/dev/null 2>&1; then
+    ok "Отмонтирован: $mountpt"
+  else
+    warn "diskutil не справился, пробую umount (sudo)..."
+    $SUDO_CMD umount "$mountpt"
+    ok "Отмонтирован: $mountpt"
+  fi
+}
+
+each_ntfs() {
+  list_ntfs_partitions | while IFS='|' read -r ident _ _ _; do
+    [[ -n "$ident" ]] && "$1" "$ident"
+  done
+}
+
+cmd_mount() {
+  local target="${1:-}"
+  [[ -z "$target" ]] && die "Укажите раздел: ntfs-mount mount <diskXsY|label|all>"
+  if [[ "$target" == "all" ]]; then
+    each_ntfs mount_one
+    return
+  fi
+  local ident
+  ident="$(resolve_disk "$target")"
+  [[ -z "$ident" ]] && die "Не нашёл NTFS-раздел '$target'. Запустите: ntfs-mount list"
+  mount_one "$ident"
+}
+
+cmd_unmount() {
+  local target="${1:-}"
+  [[ -z "$target" ]] && die "Укажите раздел: ntfs-mount unmount <diskXsY|label|all>"
+  if [[ "$target" == "all" ]]; then
+    each_ntfs unmount_one
+    return
+  fi
+  local ident
+  ident="$(resolve_disk "$target")"
+  [[ -z "$ident" ]] && die "Не нашёл NTFS-раздел '$target'."
+  unmount_one "$ident"
+}
+
+cmd_auto() {
+  local rows
+  rows="$(list_ntfs_partitions || true)"
+  if [[ -z "$rows" ]]; then
+    info "NTFS-разделы не найдены. Подключите диск и повторите."
+    return 0
+  fi
+  each_ntfs mount_one
+}
+
+main() {
+  local cmd="${1:-list}"
+  shift || true
+  case "$cmd" in
+    list|ls)        cmd_list ;;
+    mount|m)        cmd_mount "$@" ;;
+    unmount|umount|u) cmd_unmount "$@" ;;
+    auto|a)         cmd_auto ;;
+    -h|--help|help) usage 0 ;;
+    *)              err "Неизвестная команда: $cmd"; usage 1 ;;
+  esac
+}
+
+main "$@"
