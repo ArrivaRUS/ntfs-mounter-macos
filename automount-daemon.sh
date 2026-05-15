@@ -64,6 +64,17 @@ while :; do
     id="$(awk '{print $1}' <<< "$line")"
     [[ -z "$id" ]] && continue
 
+    # Уважаем marker от eject: пользователь явно попросил извлечь -- не лезем
+    marker="/tmp/ntfs-mount.ejecting.$id"
+    if [[ -f "$marker" ]]; then
+      mtime="$(stat -f '%m' "$marker" 2>/dev/null || echo 0)"
+      now="$(date +%s)"
+      if [[ $((now - mtime)) -lt 60 ]]; then
+        continue
+      fi
+      rm -f "$marker" 2>/dev/null
+    fi
+
     if is_handled "$id"; then
       continue
     fi

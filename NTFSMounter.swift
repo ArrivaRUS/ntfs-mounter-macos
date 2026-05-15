@@ -171,16 +171,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc func ejectOne(_ sender: NSMenuItem) {
         guard let device = sender.representedObject as? String else { return }
-        // diskutil eject для внешних дисков не требует sudo
-        _ = runShell("/usr/sbin/diskutil", args: ["eject", device])
+        ejectViaUtility(device: device)
         rebuildMenu()
     }
 
     @objc func ejectAll() {
         for disk in listDisks() {
-            _ = runShell("/usr/sbin/diskutil", args: ["eject", disk.device])
+            ejectViaUtility(device: disk.device)
         }
         rebuildMenu()
+    }
+
+    // Вызывает `ntfs-mount eject`. Сначала пробует через sudo -n (если есть
+    // sudoers-правило, установленное install-gui.sh) -- работает без UI.
+    // Если sudoers не настроен -- fallback на стандартный macOS admin-prompt.
+    func ejectViaUtility(device: String) {
+        // 1. Попытка без UI через sudo -n
+        let p = Process()
+        p.launchPath = "/usr/bin/sudo"
+        p.arguments = ["-n", ntfsMountBin, "eject", device]
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = pipe
+        do { try p.run() } catch { return }
+        p.waitUntilExit()
+
+        if p.terminationStatus == 0 { return }
+
+        // 2. Fallback: системный admin-prompt
+        runWithAdminPrompt(
+            message: "Eject \(device)",
+            shell: "\(ntfsMountBin) eject \(device)"
+        )
     }
 
     // MARK: - Shell helpers
