@@ -3,6 +3,7 @@
 **English** | [Русский](README.ru.md)
 
 [![CI](https://github.com/ArrivaRUS/ntfs-mounter-macos/actions/workflows/ci.yml/badge.svg)](https://github.com/ArrivaRUS/ntfs-mounter-macos/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/ArrivaRUS/ntfs-mounter-macos)](https://github.com/ArrivaRUS/ntfs-mounter-macos/releases)
 
 NTFS read/write support for macOS on Apple Silicon — **no kernel extensions, no Reduced Security mode**. Pairs the user-space [FUSE-T](https://github.com/macos-fuse-t/fuse-t) with the [macos-fuse-t/ntfs-3g](https://github.com/macos-fuse-t/ntfs-3g) fork, and wraps them with:
 
@@ -12,6 +13,16 @@ NTFS read/write support for macOS on Apple Silicon — **no kernel extensions, n
 - automatic defence against Apple's built-in FSKit NTFS driver (which silently re-mounts the same disk read-only in parallel on macOS Tahoe).
 
 Tested on **macOS 26 Tahoe / Apple Silicon**.
+
+## 🇷🇺 По-русски
+
+**Полная документация на русском языке: [README.ru.md](README.ru.md)**
+
+Кратко: утилита даёт macOS на Apple Silicon полноценную **запись на NTFS-диски** — без kernel extensions и без понижения защиты системы. Диск автоматически монтируется в режиме чтения-записи через несколько секунд после подключения; в строке меню появляется значок со статусом дисков и кнопками Eject. Установка в три шага:
+
+```bash
+bash install.sh && bash install-gui.sh && bash grant-permissions.sh
+```
 
 ## Why
 

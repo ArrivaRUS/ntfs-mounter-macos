@@ -3,6 +3,7 @@
 [English](README.md) | **Русский**
 
 [![CI](https://github.com/ArrivaRUS/ntfs-mounter-macos/actions/workflows/ci.yml/badge.svg)](https://github.com/ArrivaRUS/ntfs-mounter-macos/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/ArrivaRUS/ntfs-mounter-macos)](https://github.com/ArrivaRUS/ntfs-mounter-macos/releases)
 
 Чтение **и запись** NTFS на macOS с Apple Silicon — **без kernel extensions и без режима Reduced Security**. Связка user-space [FUSE-T](https://github.com/macos-fuse-t/fuse-t) и форка [macos-fuse-t/ntfs-3g](https://github.com/macos-fuse-t/ntfs-3g), обёрнутая в:
 
