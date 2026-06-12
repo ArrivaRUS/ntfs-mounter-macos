@@ -2,12 +2,14 @@
 # ntfs-mount — удобная CLI-обёртка для работы с NTFS-дисками на macOS через FUSE-T + ntfs-3g.
 #
 # Команды:
-#   ntfs-mount list                — показать все NTFS-разделы и их статус
+#   ntfs-mount list [--porcelain]  — показать все NTFS-разделы и их статус
 #   ntfs-mount mount <disk|all>    — отмонтировать RO Apple-драйвер и смонтировать через ntfs-3g (RW)
 #   ntfs-mount unmount <disk|all>  — безопасно отмонтировать
+#   ntfs-mount eject <disk|all>    — отмонтировать и извлечь физически
 #   ntfs-mount auto                — найти все NTFS и перемонтировать в RW (без аргумента = mount all)
 #
 # <disk> — идентификатор раздела (например disk4s1) ИЛИ метка тома ("MyDrive").
+# Отладка: NTFS_MOUNT_DEBUG=1 включает построчный [trace]-вывод.
 
 # Намеренно НЕ используем `set -e` -- он слишком агрессивный для скрипта,
 # который часто работает с командами, возвращающими "успешный" non-zero
@@ -43,13 +45,15 @@ usage() {
 ntfs-mount — CLI для работы с NTFS-дисками на macOS через FUSE-T + ntfs-3g.
 
 Команды:
-  ntfs-mount list                — показать все NTFS-разделы и их статус
+  ntfs-mount list [--porcelain]  — показать все NTFS-разделы и их статус
   ntfs-mount mount <disk|all>    — отмонтировать RO-маунт Apple и поднять через ntfs-3g (RW)
   ntfs-mount unmount <disk|all>  — безопасно отмонтировать
   ntfs-mount eject <disk|all>    — отмонтировать и извлечь физически (защита от автомонта на 60с)
   ntfs-mount auto                — перемонтировать все NTFS в RW (= mount all)
 
 <disk> — идентификатор раздела (например disk4s1) ИЛИ метка тома ("MyDrive").
+--porcelain — машинный вывод: device|label|fs|mountpoint|state (state: RW, RO или пусто).
+NTFS_MOUNT_DEBUG=1 — построчный [trace]-вывод для диагностики.
 EOF
   exit "${1:-0}"
 }
@@ -190,36 +194,59 @@ resolve_disk() {
   echo "$found"
 }
 
+# Состояние маунта для mountpoint: печатает "RW", "RO" или "" (не смонтирован).
+# grep -F " on <mp> (" вместо awk '$3==mp' -- устойчиво к пробелам в метках.
+mount_state() {
+  local mountpt="$1"
+  if [[ -z "$mountpt" ]]; then
+    echo ""
+    return 0
+  fi
+  local mline
+  mline="$(/sbin/mount 2>/dev/null | grep -F " on $mountpt (")"
+  if echo "$mline" | grep -qE "^fuse-t:|ntfs-3g|macfuse"; then
+    echo "RW"
+  elif echo "$mline" | grep -q "read-only"; then
+    echo "RO"
+  elif [[ -n "$mline" ]]; then
+    echo "RW"
+  else
+    echo ""
+  fi
+}
+
 cmd_list() {
+  local porcelain=0
+  [[ "${1:-}" == "--porcelain" ]] && porcelain=1
+
   local rows
   rows="$(list_ntfs_partitions || true)"
   if [[ -z "$rows" ]]; then
-    info "NTFS-разделов не найдено. Убедитесь, что диск подключён."
+    # В porcelain-режиме пустой вывод = нет дисков (скрипты это ожидают)
+    [[ "$porcelain" == "1" ]] || info "NTFS-разделов не найдено. Убедитесь, что диск подключён."
     return 0
   fi
+
+  if [[ "$porcelain" == "1" ]]; then
+    # Машинный вывод: device|label|fs|mountpoint|state -- без ANSI и выравнивания
+    while IFS='|' read -r ident label fs mountpt; do
+      [[ -z "$ident" ]] && continue
+      printf '%s|%s|%s|%s|%s\n' "$ident" "$label" "$fs" "$mountpt" "$(mount_state "$mountpt")"
+    done <<< "$rows"
+    return 0
+  fi
+
   printf "%-12s  %-24s  %-10s  %s\n" "DEVICE" "LABEL" "FS" "MOUNT POINT"
   printf "%-12s  %-24s  %-10s  %s\n" "------" "-----" "--" "-----------"
   while IFS='|' read -r ident label fs mountpt; do
     [[ -z "$ident" ]] && continue
     local mp_disp="$mountpt"
     [[ -z "$mp_disp" ]] && mp_disp="${C_DIM}(не смонтирован)${C_OFF}"
-    # помечаем RW/RO. Логика:
-    #   - источник "fuse-t:..." или тип "ntfs-3g"/"fuse-t"/"macfuse" -> наш RW
-    #   - "read-only" -> RO
-    #   - всё остальное -> RW по умолчанию (apple ntfs обычно read-only,
-    #     но определяется выше через `read-only` маркер)
     local rw_tag=""
-    if [[ -n "$mountpt" ]]; then
-      local mline
-      mline="$(/sbin/mount 2>/dev/null | awk -v mp="$mountpt" '$3 == mp')"
-      if echo "$mline" | grep -qE "^fuse-t:|ntfs-3g|macfuse"; then
-        rw_tag=" ${C_GREEN}[RW]${C_OFF}"
-      elif echo "$mline" | grep -q "read-only"; then
-        rw_tag=" ${C_YELLOW}[RO]${C_OFF}"
-      else
-        rw_tag=" ${C_GREEN}[RW]${C_OFF}"
-      fi
-    fi
+    case "$(mount_state "$mountpt")" in
+      RW) rw_tag=" ${C_GREEN}[RW]${C_OFF}" ;;
+      RO) rw_tag=" ${C_YELLOW}[RO]${C_OFF}" ;;
+    esac
     printf "%-12s  %-24s  %-10s  %b%b\n" "$ident" "$label" "$fs" "$mp_disp" "$rw_tag"
   done <<< "$rows"
 }
@@ -255,7 +282,7 @@ resolve_owner() {
 
   # Если всё равно 0 -- die, лучше совсем не монтировать
   if [[ -z "$OWNER_UID" || "$OWNER_UID" == "0" ]]; then
-    die "Не удалось определить пользователя для монтирования (NTFS_OWNER_USER не задан, /dev/console=root). Запустите: NTFS_OWNER_USER=<your-username> ntfs-mount mount $1"
+    die "Не удалось определить пользователя для монтирования (NTFS_OWNER_USER не задан, /dev/console=root). Запустите: NTFS_OWNER_USER=<your-username> ntfs-mount mount <disk>"
   fi
 }
 
@@ -302,7 +329,14 @@ unmount_competitors() {
   done <<< "$mps"
 }
 
-_trace() { info "[trace] $1"; }
+# Диагностический trace -- активен только при NTFS_MOUNT_DEBUG=1
+# (демон включает его для себя, чтобы в логе оставалась полная картина).
+_trace() {
+  if [[ "${NTFS_MOUNT_DEBUG:-0}" == "1" ]]; then
+    info "[trace] $1"
+  fi
+  return 0
+}
 
 mount_one() {
   _trace "mount_one: start ident=$1 uid=$(id -u) pid=$$"
@@ -340,7 +374,7 @@ mount_one() {
 
   # Если уже наш ntfs-3g на правильной точке -- проверяем что он живой
   # и привязан к ТЕКУЩЕМУ /dev/$ident, не к зомби-устройству.
-  if mount | awk -v mp="$target_mp" '$3==mp' | grep -qE "ntfs-3g|fuse-t"; then
+  if /sbin/mount 2>/dev/null | grep -F " on $target_mp (" | grep -qE "ntfs-3g|fuse-t"; then
     local stale_pid
     stale_pid="$(pgrep -f "ntfs-3g .*$target_mp" 2>/dev/null | head -1)"
     if [[ -n "$stale_pid" ]]; then
@@ -393,11 +427,12 @@ mount_one() {
   #   noatime -- не обновляем access time (меньше блокировок при чтении папок Finder'ом)
   #   uid/gid -- владелец смонтированной ФС = пользователь GUI
   #   local -- помечает том как локальный (виден в боковой панели Finder)
-  set +e
+  # errexit глобально выключен (см. шапку) -- просто фиксируем exit-код.
+  # ВАЖНО: не добавлять здесь `set -e` -- он останется включённым до конца
+  # работы скрипта и сломает `mount all` на втором диске.
   $SUDO_CMD "$NTFS_3G_BIN" "/dev/$ident" "$target_mp" \
     -o "recover,remove_hiberfile,auto_xattr,allow_other,big_writes,noatime,uid=$OWNER_UID,gid=$OWNER_GID,local,volname=$label"
   ntfs3g_rc=$?
-  set -e
   _trace "ntfs-3g вернул код $ntfs3g_rc"
   if [ "$ntfs3g_rc" -ne 0 ]; then
     die "ntfs-3g упал с кодом $ntfs3g_rc"
@@ -442,12 +477,14 @@ unmount_one() {
 }
 
 # EJECT_MARKER_DIR -- где лежат «не монтировать» флаги для демона.
-# /tmp доступен без sudo, демон в курсе об этом каталоге.
-EJECT_MARKER_DIR="/tmp"
+# /var/run принадлежит root: обычный пользователь не может подложить
+# симлинк с предсказуемым именем (в /tmp это была бы symlink-атака --
+# root-процесс сделал бы touch по произвольному пути).
+EJECT_MARKER_DIR="/var/run/ntfs-mount"
 EJECT_MARKER_TTL=60   # секунд
 
 # Демон должен пропускать диски с этим маркером
-eject_marker_path() { echo "$EJECT_MARKER_DIR/ntfs-mount.ejecting.$1"; }
+eject_marker_path() { echo "$EJECT_MARKER_DIR/ejecting.$1"; }
 
 # Возвращает 0 если marker свежий
 is_ejecting() {
@@ -472,18 +509,37 @@ eject_one() {
   parent="$(parent_disk "$ident")"
 
   # 1. Маркер -- демон не должен перемонтировать пока идёт eject.
-  touch "$(eject_marker_path "$ident")" 2>/dev/null || true
+  #    mkdir+touch через sudo: каталог root-owned (см. EJECT_MARKER_DIR).
+  $SUDO_CMD mkdir -p "$EJECT_MARKER_DIR" 2>/dev/null || true
+  $SUDO_CMD touch "$(eject_marker_path "$ident")" 2>/dev/null || true
 
   # 2. ОТМОНТИРОВАТЬ наш FUSE-T NFS-mount явно. diskutil его НЕ видит
   #    (это сетевой NFS, не в DiskArbitration базе), поэтому
   #    `diskutil eject` всегда отвечает "Volume failed to eject", пока
   #    наш mount живой.
-  local fuse_mp
-  fuse_mp="$(/sbin/mount 2>/dev/null | awk '
-    $1 ~ "^fuse-t:" {
-      s = index($0, " on "); rest = substr($0, s+4);
-      e = index(rest, " ("); print substr(rest, 1, e-1); exit
-    }')"
+  #
+  #    ВАЖНО: ищем mount именно ЭТОГО диска (по его метке), а не первый
+  #    попавшийся fuse-t -- иначе при двух подключённых NTFS-дисках
+  #    eject диска A размонтирует диск B.
+  local label=""
+  IFS='|' read -r _ label _ _ < <(list_ntfs_partitions | awk -F'|' -v d="$ident" '$1==d')
+  if [[ -z "$label" || "$label" == "(no label)" ]]; then
+    label="$(diskutil info "$ident" 2>/dev/null | awk -F: '/^[[:space:]]*Volume Name/ { sub(/^[[:space:]]+/, "", $2); print $2; exit }')"
+  fi
+
+  local fuse_mp=""
+  if [[ -n "$label" && "$label" != "(no label)" ]]; then
+    fuse_mp="$(/sbin/mount 2>/dev/null | awk -v src="fuse-t:/$label" '
+      $1 == src {
+        s = index($0, " on "); rest = substr($0, s+4);
+        e = index(rest, " ("); print substr(rest, 1, e-1); exit
+      }')"
+  fi
+  # Диск без метки монтируется нами в /Volumes/NTFS-<ident>
+  if [[ -z "$fuse_mp" ]]; then
+    fuse_mp="$(/sbin/mount 2>/dev/null | grep -F " on $DEFAULT_MOUNT_ROOT/NTFS-$ident (" \
+      | grep -E "^fuse-t:" | sed -e 's/^.* on //' -e 's/ (.*$//' | head -1)"
+  fi
   if [[ -n "$fuse_mp" ]]; then
     info "Размонтирую FUSE-T mount: $fuse_mp"
     diskutil unmount "$fuse_mp" >/dev/null 2>&1 \
@@ -591,7 +647,7 @@ main() {
   local cmd="${1:-list}"
   shift || true
   case "$cmd" in
-    list|ls)        cmd_list ;;
+    list|ls)        cmd_list "$@" ;;
     mount|m)        cmd_mount "$@" ;;
     unmount|umount|u) cmd_unmount "$@" ;;
     eject|e)        cmd_eject "$@" ;;

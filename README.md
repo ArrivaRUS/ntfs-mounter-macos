@@ -1,8 +1,12 @@
 # NTFS Mounter for macOS
 
-NTFS read/write support for macOS on Apple Silicon — **no kernel extensions, no Reduced Security mode**. Pairs Apple's user-space FSKit-compatible [FUSE-T](https://github.com/macos-fuse-t/fuse-t) with the [macos-fuse-t/ntfs-3g](https://github.com/macos-fuse-t/ntfs-3g) fork, and wraps them with:
+**English** | [Русский](README.ru.md)
 
-- a CLI (`ntfs-mount list / mount / unmount / auto`),
+[![CI](https://github.com/ArrivaRUS/ntfs-mounter-macos/actions/workflows/ci.yml/badge.svg)](https://github.com/ArrivaRUS/ntfs-mounter-macos/actions/workflows/ci.yml)
+
+NTFS read/write support for macOS on Apple Silicon — **no kernel extensions, no Reduced Security mode**. Pairs the user-space [FUSE-T](https://github.com/macos-fuse-t/fuse-t) with the [macos-fuse-t/ntfs-3g](https://github.com/macos-fuse-t/ntfs-3g) fork, and wraps them with:
+
+- a CLI (`ntfs-mount list / mount / unmount / eject / auto`),
 - a **LaunchDaemon** that automatically mounts every NTFS drive in read/write as soon as it's plugged in,
 - a **menu-bar app** with per-drive Eject buttons,
 - automatic defence against Apple's built-in FSKit NTFS driver (which silently re-mounts the same disk read-only in parallel on macOS Tahoe).
@@ -22,16 +26,19 @@ macOS reads NTFS but can't write to it. Standard solutions either cost money (Pa
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │   Menu-bar app (Swift)            macOS GUI                 │
-│   - lists NTFS drives, "● RW" / "○ RO" indicator            │
+│   - builds menu on open from `ntfs-mount list --porcelain`  │
+│   - "● RW" / "○ RO" indicator per drive                     │
 │   - Eject per disk / Eject All / Open in Finder             │
+│   - privileged ops via sudo -n, fallback to admin prompt    │
 └──────────────────────┬──────────────────────────────────────┘
-                       │ polls `ntfs-mount list` every 4s
-                       │ ejects via `diskutil eject`
+                       │ calls `ntfs-mount eject / mount`
 ┌──────────────────────┴──────────────────────────────────────┐
 │   ntfs-mount (bash CLI)                                     │
 │   - parses `diskutil list` + `mount`                        │
 │   - hot-replaces zombie mounts from old device IDs          │
 │   - kills Apple's parallel FSKit-NTFS mounts                │
+│   - label-scoped eject: unmount FUSE-T mount + SIGTERM      │
+│     ntfs-3g, then `diskutil eject`                          │
 └──────────────────────┬──────────────────────────────────────┘
                        │ uses
 ┌──────────────────────┴──────────────────────────────────────┐
@@ -41,10 +48,11 @@ macOS reads NTFS but can't write to it. Standard solutions either cost money (Pa
 
 ┌─────────────────────────────────────────────────────────────┐
 │   automount-daemon (LaunchDaemon, root)                     │
-│   - polls every 3s                                          │
+│   - polls every 3s via `ntfs-mount list --porcelain`        │
 │   - new NTFS drive → mounts RW                              │
 │   - Apple FSKit parasite re-appears → unmounts it           │
 │   - resolves owner uid via /dev/console (the GUI user)      │
+│   - respects eject markers in /var/run/ntfs-mount           │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -71,18 +79,30 @@ The third step is the only non-obvious one. Even running as root, a LaunchDaemon
 
 `grant-permissions.sh` opens the right System Settings page and walks you through it.
 
+> **Note:** FDA grants are tied to the binary's hash. If you rebuild/reinstall `ntfs-3g`, re-add it in System Settings → Privacy & Security → Full Disk Access.
+
 ## Usage
 
-After install, just **plug in an NTFS drive**. Within ~5 seconds it appears mounted read/write at `/Volumes/<label>`, and the menu-bar icon updates.
+After install, just **plug in an NTFS drive**. Within ~5–10 seconds it appears mounted read/write at `/Volumes/<label>`, and the menu-bar icon shows it with a `● RW` tag.
 
 For manual control:
 
 ```bash
 ntfs-mount list                 # all NTFS volumes with their RO/RW status
+ntfs-mount list --porcelain     # machine-readable: device|label|fs|mountpoint|state
 ntfs-mount mount disk4s1        # remount this disk as RW (by id or label)
 ntfs-mount mount all
 ntfs-mount unmount disk4s1
+ntfs-mount eject disk4s1        # unmount + gracefully stop ntfs-3g + diskutil eject
 ntfs-mount auto                 # remount all NTFS as RW
+
+NTFS_MOUNT_DEBUG=1 ntfs-mount mount disk4s1   # per-step trace for diagnostics
+```
+
+To re-format a drive whose NTFS got corrupted beyond repair (erases everything, asks for confirmation):
+
+```bash
+LABEL="MyDrive" bash format-ntfs.sh
 ```
 
 ## Known sharp edges this project solves
@@ -96,12 +116,13 @@ These are real problems we hit while building this, and the workarounds are bake
 | macOS bash is **3.2** — no associative arrays, no `printf '%(...)T'`, UTF-8 ellipsis breaks `$VAR…` parsing | All scripts are bash-3.2-compatible (no `declare -A`, ASCII only near variables) |
 | LaunchDaemon gets `Operation not permitted` on `/dev/diskX` even as root | `grant-permissions.sh` opens System Settings → Full Disk Access page |
 | macOS Tahoe FSKit silently re-mounts every NTFS read-only in parallel, blocking writes | Daemon detects parasitic `fskit`/`read-only` mounts and unmounts them every cycle |
-| Zombie `ntfs-3g` processes survive a USB unplug and keep holding `/Volumes/<label>` with stale data | `mount_one` inspects `ps -o args=` and `kill -9`s ntfs-3g processes whose `/dev/diskX` no longer matches the current device |
+| Zombie `ntfs-3g` processes survive a USB unplug and keep holding `/Volumes/<label>` with stale data | `mount_one` inspects `ps -o args=` and kills ntfs-3g processes whose `/dev/diskX` no longer matches the current device |
 | When daemon runs as root, `$(id -un)` returns `root` and the mount ends up with `uid=0` (nobody but root can write) | `resolve_owner` first reads `NTFS_OWNER_USER` env, then falls back to `stat -f '%Su' /dev/console`, then to first uid≥501 from `dscl` — and refuses to mount if it still gets `0` |
 | `diskutil info` doesn't report mount points for FUSE-T NFS-based mounts | Parser falls back to `/sbin/mount` matching by `/dev/diskX`, then by `fuse-t:/<label>`, then by guessing `/Volumes/<label>` |
-| `ntfs-mount eject` couldn't find a disk that `diskutil` had stopped tagging as NTFS (because FUSE-T was holding it) | `resolve_disk` falls back to scanning live fuse-t mounts via `mount` + introspecting `ntfs-3g` process args |
+| `diskutil eject` always fails with "Volume failed to eject" while a FUSE-T mount is alive — DiskArbitration simply doesn't see NFS-style mounts | `eject` explicitly unmounts the FUSE-T mount (scoped to *this* disk's label, so a second NTFS drive is untouched), SIGTERMs ntfs-3g, then runs `diskutil eject` |
+| `set -e` + command substitution of tools that return non-zero on success (`ntfsfix` journal replay, `diskutil unmount` of unmounted path) silently killed the script mid-function | Scripts run with `set -uo pipefail` only; critical exit codes are checked explicitly |
 | Apple's Spotlight and `fseventsd` hold files open on NTFS volumes, breaking Finder's move-to-Trash with "object is in use" | After every mount the utility runs `mdutil -i off` on the volume and touches `.fseventsd/no_log` |
-| NTFS volumes silently accumulate journal/MFT damage on macOS (no native chkdsk) and start refusing `rmdir` | Pre-mount we run `ntfsfix -n` and log a clear warning advising `chkdsk /f` on Windows. Periodic Windows-side check is mandatory for heavily-used NTFS drives. |
+| NTFS volumes silently accumulate journal/MFT damage on macOS (no native chkdsk) and start refusing `rmdir` | `ntfs-3g` mounts with the `recover` option (journal replay); for real MFT damage use `chkdsk /f` on Windows — or `format-ntfs.sh` if the data is expendable |
 
 ## Components
 
@@ -111,7 +132,8 @@ These are real problems we hit while building this, and the workarounds are bake
 | `install-gui.sh` | Compiles `NTFSMounter.swift` into `~/Applications/NTFSMounter.app`, sets up LaunchDaemon + LaunchAgent |
 | `grant-permissions.sh` | Walks user through giving Full Disk Access to `ntfs-3g` and `/bin/bash` |
 | `uninstall-gui.sh` | Removes the GUI layer (keeps driver/CLI) |
-| `ntfs-mount` | bash CLI — mount/unmount/list logic, FSKit-killing, zombie cleanup, owner resolution |
+| `format-ntfs.sh` | Safe re-format of a drive to fresh NTFS (asks for `YES` confirmation) |
+| `ntfs-mount` | bash CLI — mount/unmount/eject/list logic, FSKit-killing, zombie cleanup, owner resolution |
 | `automount-daemon.sh` | Polling loop (bash 3.2 compatible) — calls `ntfs-mount` on state changes |
 | `NTFSMounter.swift` | Menu-bar app using `NSStatusBar` + `externaldrive.fill` SF Symbol |
 | `com.user.ntfs-automount.plist` | LaunchDaemon plist (root, KeepAlive) |
@@ -126,8 +148,8 @@ FUSE-T routes I/O through a user-space NFS server, so throughput is noticeably b
 - **Don't pull the plug.** Always Eject through the menu-bar (or `ntfs-mount eject`). FUSE-T caches writes; physical disconnect without sync risks NTFS journal damage.
 - After the first write to a drive that was last touched by Windows with **Fast Startup** enabled, macOS may pop up "Disk needs to be checked" — this is the NTFS journal flag flipping. Press *Skip* / *Ignore*.
 - The Apple FSKit NTFS driver on macOS Tahoe **will** keep trying to mount your drive in parallel. The daemon keeps killing it. If you stop the daemon (`sudo launchctl bootout system/com.user.ntfs-automount`), you'll be back to read-only mode within seconds.
-- **macOS has no full NTFS repair tool.** `ntfsfix` shipped with this project only replays the journal — it can't fix MFT-level corruption that builds up after improper unmounts or hard kills of `ntfs-3g`. If you see `Volume is corrupt` from `ntfsfix -n`, or notice empty directories that refuse to `rmdir` with `Directory not empty`, you need to plug the disk into a **Windows machine** and run `chkdsk D: /f /r`. On the next reconnect to macOS those phantom entries will be gone. There is no Mac-side workaround for this.
-- **Don't `kill -9` ntfs-3g.** Hard-killing the `ntfs-3g` process tears down the FUSE-T NFS channel mid-flight, which makes macOS *eject the entire USB device*. The `eject` command in this utility uses `diskutil eject` (graceful) rather than killing processes, exactly for this reason.
+- **macOS has no full NTFS repair tool.** `ntfsfix` shipped with this project only replays the journal — it can't fix MFT-level corruption. If you see phantom directories that refuse to `rmdir` with `Directory not empty`, plug the disk into a **Windows machine** and run `chkdsk D: /f /r` — or, if the data is expendable, re-format with `format-ntfs.sh`.
+- **Never `kill -9` ntfs-3g manually.** Hard-killing it tears down the FUSE-T NFS channel mid-flight, and macOS *ejects the entire USB device*. The `eject` command unmounts first and stops ntfs-3g with SIGTERM (graceful) — it only escalates if the process ignores it.
 
 ## Uninstall
 

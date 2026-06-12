@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint-and-build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: ShellCheck
+        run: |
+          brew install shellcheck
+          shellcheck -s bash -S warning \
+            ntfs-mount automount-daemon.sh install.sh install-gui.sh \
+            grant-permissions.sh uninstall-gui.sh format-ntfs.sh
+
+      - name: bash 3.2 syntax check
+        run: |
+          for f in ntfs-mount automount-daemon.sh install.sh install-gui.sh \
+                   grant-permissions.sh uninstall-gui.sh format-ntfs.sh; do
+            /bin/bash -n "$f" && echo "OK $f"
+          done
+
+      - name: plist lint
+        run: plutil -lint com.user.ntfs-automount.plist com.user.ntfsmounter.plist
+
+      - name: Swift build (menu-bar app)
+        run: swiftc -O -o /tmp/NTFSMounter NTFSMounter.swift -framework Cocoa

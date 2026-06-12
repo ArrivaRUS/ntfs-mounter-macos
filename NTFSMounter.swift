@@ -2,6 +2,11 @@
 // Показывает иконку диска в статус-баре; в меню — список NTFS-разделов
 // (Read/Write через ntfs-3g или Read-Only Apple-драйвер) с кнопками Eject.
 //
+// Меню перестраивается в момент открытия (NSMenuDelegate.menuNeedsUpdate),
+// фонового поллинга нет. Данные берутся из `ntfs-mount list --porcelain`
+// (машинный формат device|label|fs|mountpoint|state — устойчив к пробелам
+// в метках томов).
+//
 // Сборка: см. install-gui.sh
 
 import Cocoa
@@ -14,9 +19,9 @@ struct NTFSDisk {
     let isMounted: Bool
 }
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var statusItem: NSStatusItem!
-    var refreshTimer: Timer!
+    let menu = NSMenu()
     let ntfsMountBin = "/usr/local/bin/ntfs-mount"
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -27,47 +32,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             button.image = img
             button.imagePosition = .imageOnly
         }
+        menu.delegate = self
+        statusItem.menu = menu
+    }
 
-        rebuildMenu()
-        refreshTimer = Timer.scheduledTimer(withTimeInterval: 4.0, repeats: true) { [weak self] _ in
-            self?.rebuildMenu()
-        }
+    // Вызывается системой каждый раз перед показом меню — свежие данные
+    // ровно тогда, когда они нужны, без фонового таймера.
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        populate(menu)
     }
 
     // MARK: - Disk discovery
 
     func listDisks() -> [NTFSDisk] {
         guard FileManager.default.isExecutableFile(atPath: ntfsMountBin) else { return [] }
-        let raw = runShell(ntfsMountBin, args: ["list"]) ?? ""
+        let raw = runShell(ntfsMountBin, args: ["list", "--porcelain"]) ?? ""
 
         var disks: [NTFSDisk] = []
-        // Парсим вывод (skip header rows). Формат строки:
-        //   DEVICE    LABEL    FS    MOUNT POINT [RO|RW]
-        let lines = raw.split(separator: "\n").map(String.init)
-        for line in lines {
-            if line.hasPrefix("DEVICE") || line.hasPrefix("------") || line.contains("NTFS-разделов") { continue }
-            // strip ANSI
-            let clean = line.replacingOccurrences(of: "\u{001B}\\[[0-9;]*m", with: "", options: .regularExpression)
-            let cols = clean.split(whereSeparator: { $0 == " " || $0 == "\t" }).map(String.init)
-            guard cols.count >= 3 else { continue }
-            let device = cols[0]
-            let label = cols[1]
-            let fs = cols[2]
-            guard !fs.lowercased().contains("ntfs") || device.hasPrefix("disk") else { continue }
-            let rest = cols.dropFirst(3).joined(separator: " ")
-            let isRW = rest.contains("[RW]")
-            let isRO = rest.contains("[RO]")
-            let mount = rest
-                .replacingOccurrences(of: "[RW]", with: "")
-                .replacingOccurrences(of: "[RO]", with: "")
-                .replacingOccurrences(of: "(не смонтирован)", with: "")
-                .trimmingCharacters(in: .whitespaces)
-            let isMounted = !mount.isEmpty && (isRW || isRO)
+        for line in raw.split(separator: "\n") {
+            // device|label|fs|mountpoint|state
+            let f = line.split(separator: "|", omittingEmptySubsequences: false).map(String.init)
+            guard f.count >= 5, f[0].hasPrefix("disk") else { continue }
+            let state = f[4].trimmingCharacters(in: .whitespaces)
+            let mountPoint = f[3]
             disks.append(NTFSDisk(
-                device: device, label: label,
-                mountPoint: mount,
-                isReadWrite: isRW,
-                isMounted: isMounted
+                device: f[0],
+                label: f[1],
+                mountPoint: mountPoint,
+                isReadWrite: state == "RW",
+                isMounted: !mountPoint.isEmpty && !state.isEmpty
             ))
         }
         return disks
@@ -75,8 +68,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Menu
 
-    func rebuildMenu() {
-        let menu = NSMenu()
+    func populate(_ menu: NSMenu) {
+        menu.removeAllItems()
         let disks = listDisks()
 
         if disks.isEmpty {
@@ -94,11 +87,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         menu.addItem(.separator())
-        let refresh = NSMenuItem(title: "Refresh", action: #selector(refreshNow), keyEquivalent: "r")
-        refresh.target = self
-        menu.addItem(refresh)
-
-        menu.addItem(.separator())
         let logs = NSMenuItem(title: "Open Automount Log", action: #selector(openLog), keyEquivalent: "")
         logs.target = self
         menu.addItem(logs)
@@ -106,8 +94,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let quit = NSMenuItem(title: "Quit NTFS Mounter", action: #selector(quit), keyEquivalent: "q")
         quit.target = self
         menu.addItem(quit)
-
-        statusItem.menu = menu
     }
 
     func addDiskSection(to menu: NSMenu, disk: NTFSDisk) {
@@ -148,8 +134,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Actions
 
-    @objc func refreshNow() { rebuildMenu() }
-
     @objc func quit() { NSApp.terminate(nil) }
 
     @objc func openLog() {
@@ -163,33 +147,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc func remount(_ sender: NSMenuItem) {
         guard let device = sender.representedObject as? String else { return }
-        // ntfs-mount mount требует sudo. У GUI без sudoers это покажет пароль через osascript.
-        runWithAdminPrompt(message: "Перемонтировать \(device) в режиме чтения-записи",
-                           shell: "\(ntfsMountBin) mount \(device)")
-        rebuildMenu()
+        runPrivileged(args: ["mount", device],
+                      prompt: "Перемонтировать \(device) в режиме чтения-записи")
     }
 
     @objc func ejectOne(_ sender: NSMenuItem) {
         guard let device = sender.representedObject as? String else { return }
-        ejectViaUtility(device: device)
-        rebuildMenu()
+        runPrivileged(args: ["eject", device], prompt: "Eject \(device)")
     }
 
     @objc func ejectAll() {
         for disk in listDisks() {
-            ejectViaUtility(device: disk.device)
+            runPrivileged(args: ["eject", disk.device], prompt: "Eject \(disk.device)")
         }
-        rebuildMenu()
     }
 
-    // Вызывает `ntfs-mount eject`. Сначала пробует через sudo -n (если есть
-    // sudoers-правило, установленное install-gui.sh) -- работает без UI.
-    // Если sudoers не настроен -- fallback на стандартный macOS admin-prompt.
-    func ejectViaUtility(device: String) {
-        // 1. Попытка без UI через sudo -n
+    // MARK: - Privileged execution
+
+    // Запускает `ntfs-mount <args>` с привилегиями. Сначала тихо через
+    // `sudo -n` (работает без UI, если install-gui.sh добавил sudoers-правило
+    // NOPASSWD); если sudo требует пароль -- стандартный macOS admin-prompt.
+    func runPrivileged(args: [String], prompt: String) {
         let p = Process()
         p.launchPath = "/usr/bin/sudo"
-        p.arguments = ["-n", ntfsMountBin, "eject", device]
+        p.arguments = ["-n", ntfsMountBin] + args
         let pipe = Pipe()
         p.standardOutput = pipe
         p.standardError = pipe
@@ -198,10 +179,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         if p.terminationStatus == 0 { return }
 
-        // 2. Fallback: системный admin-prompt
         runWithAdminPrompt(
-            message: "Eject \(device)",
-            shell: "\(ntfsMountBin) eject \(device)"
+            message: prompt,
+            shell: "\(ntfsMountBin) " + args.joined(separator: " ")
         )
     }
 
